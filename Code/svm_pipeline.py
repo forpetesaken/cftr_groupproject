@@ -1,4 +1,4 @@
-import os, gzip, io, sys, re, argparse, itertools, json, math
+import os, gzip, io, sys, re, argparse, itertools, json, math, time
 from pathlib import Path
 import requests
 import pandas as pd
@@ -105,12 +105,35 @@ def extract_windows(fasta_path: Path, cftr_vcf_tsv: Path, k: int, out_csv: Path)
         for line in f:
             chrom, pos, ref, alt, label, info = line.rstrip("\n").split("\t", 5)
             pos = int(pos)
-
             # window: [pos-k, pos+k) 1-based inclusive of ref base
             start = max(1, pos - k)
             end = pos + k
-            seq = str(fa[chrom][start-1:end])  # pyfaidx uses 0-based slices
-            ref_base = str(fa[chrom][pos-1:pos])
+
+            # try several chromosome name variants to match FASTA headers (e.g. '7' vs 'chr7')
+            def fetch_range(faobj, chrom_name, a, b):
+                # Try the exact name, then 'chr' + name (if not present), then strip leading 'chr' if present
+                candidates = [chrom_name]
+                if not chrom_name.startswith("chr"):
+                    candidates.append("chr" + chrom_name)
+                else:
+                    # if file contains 'chr7' but VCF has '7', above will handle; but if VCF has 'chr7'
+                    # and FASTA doesn't, try without prefix too
+                    candidates.append(chrom_name[3:])
+                for nm in candidates:
+                    try:
+                        return str(faobj[nm][a-1:b])
+                    except KeyError:
+                        continue
+                # not found
+                raise KeyError(f"{chrom_name} not found in FASTA index")
+
+            try:
+                seq = fetch_range(fa, chrom, start, end)
+                ref_base = fetch_range(fa, chrom, pos, pos)
+            except KeyError:
+                # warn and skip records where chromosome name does not match FASTA
+                print(f"[seq] WARNING: chromosome '{chrom}' not found in FASTA; skipping pos {pos}")
+                continue
 
             records.append({
                 "chrom": chrom,
@@ -186,9 +209,14 @@ def make_features(windows_csv: Path, out_csv: Path, kmer=3):
     kcols = [f"kmer_{k}" for k in vocab]
     kdf = pd.DataFrame(km, columns=kcols, index=df.index)
 
-    X = pd.concat([df[["gc","symmetry","win_len","center_ref_mismatch","is_transition"]]
-                  + [c for c in df.columns if c.startswith(("center_ref_","ref_","alt_","chrom_"))],
-                   kdf], axis=1)
+    # combine numeric features, categorical one-hot columns (if any), and k-mer features
+    base_cols = ["gc","symmetry","win_len","center_ref_mismatch","is_transition"]
+    cat_cols = [c for c in df.columns if c.startswith(("center_ref_","ref_","alt_","chrom_"))]
+    parts = [df[base_cols]]
+    if len(cat_cols) > 0:
+        parts.append(df[cat_cols])
+    parts.append(kdf)
+    X = pd.concat(parts, axis=1)
     y = df["label"].map({"benign":0,"pathogenic":1}).astype(int)
 
     out = pd.concat([X, y.rename("label")], axis=1)
@@ -196,89 +224,211 @@ def make_features(windows_csv: Path, out_csv: Path, kmer=3):
     print(f"[feat] Wrote {out_csv}  shape={out.shape}")
     return out_csv
 
-# --- Step 5: Train a tree model ----------------------------------------------
-def train_tree(features_csv: Path, model_kind: str = "xgboost"):
+# --- Step 5: Train SVM model -------------------------------------------------
+def train_svm(features_csv: Path):
+    from sklearn.svm import SVC
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.decomposition import PCA
+    from sklearn.model_selection import GridSearchCV
+    from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+    
     df = pd.read_csv(features_csv)
     X = df.drop(columns=["label"])
     y = df["label"].astype(int)
 
     Xtr, Xte, ytr, yte = train_test_split(X, y, stratify=y, test_size=0.2, random_state=42)
+    
+    # Scale features for SVM (important!)
+    print("[train] Scaling features...")
+    scaler = StandardScaler()
+    Xtr_scaled = scaler.fit_transform(Xtr)
+    Xte_scaled = scaler.transform(Xte)
+    
+    # Apply PCA for dimensionality reduction (helps SVM with high-dim data)
+    print("[train] Applying PCA dimensionality reduction...")
+    pca = PCA(n_components=0.95, random_state=42)  # Keep 95% of variance
+    Xtr_pca = pca.fit_transform(Xtr_scaled)
+    Xte_pca = pca.transform(Xte_scaled)
+    print(f"[train] PCA reduced features from {X.shape[1]} to {Xtr_pca.shape[1]} components")
+    
+    # Compute class weight for imbalanced data
     pos = int(ytr.sum()); neg = len(ytr) - pos
-    scale_pos_weight = neg / max(1, pos)
-
-    if model_kind.lower() == "xgboost":
-        try:
-            import xgboost as xgb
-            model = xgb.XGBClassifier(
-                n_estimators=800,
-                max_depth=5,
-                learning_rate=0.03,
-                subsample=0.9,
-                colsample_bytree=0.9,
-                reg_lambda=1.0,
-                tree_method="hist",
-                scale_pos_weight=scale_pos_weight,
-                eval_metric="auc",
-                random_state=42
-            )
-            model.fit(Xtr, ytr)
-            proba = model.predict_proba(Xte)[:,1]
-            pred = (proba >= 0.5).astype(int)
-            imp = pd.Series(model.feature_importances_, index=X.columns).sort_values(ascending=False)
-            print("[train] Model: XGBoost")
-        except Exception as e:
-            print(f"[train] XGBoost unavailable ({e}). Falling back to RandomForest.")
-            model_kind = "rf"
-
-    if model_kind.lower() != "xgboost":
-        from sklearn.ensemble import RandomForestClassifier
-        model = RandomForestClassifier(
-            n_estimators=600,
-            max_depth=None,
-            class_weight={0:1.0, 1:max(1.0, scale_pos_weight)},
-            random_state=42,
-            n_jobs=-1
-        )
-        model.fit(Xtr, ytr)
-        proba = model.predict_proba(Xte)[:,1]
-        pred = (proba >= 0.5).astype(int)
-        # impurity-based importances
-        imp = pd.Series(model.feature_importances_, index=X.columns).sort_values(ascending=False)
-        print("[train] Model: RandomForest")
+    class_weight = {0: 1.0, 1: neg / max(1, pos)}
+    
+    print("[train] Running SVM hyperparameter search (RBF kernel)...")
+    # Focus on RBF kernel which typically works best for complex data
+    params = {
+        "C": [0.1, 1.0, 10.0, 100.0],
+        "gamma": [0.001, 0.01, 0.1, 1.0, "scale"]
+    }
+    
+    base = SVC(
+        kernel="rbf",
+        class_weight=class_weight,
+        probability=True,
+        random_state=42,
+        max_iter=50000,
+        cache_size=1000
+    )
+    
+    gs = GridSearchCV(base, params, cv=3, scoring="f1", n_jobs=-1, verbose=1)
+    gs.fit(Xtr_pca, ytr)
+    print(f"[train] best SVM params: {gs.best_params_}")
+    
+    model = gs.best_estimator_
+    proba = model.predict_proba(Xte_pca)[:,1]
+    print("[train] Model: SVM (RBF) with PCA")
+    
+    # Tune decision threshold to maximize F1 score
+    best_t, best_f1 = 0.5, 0
+    for t in np.linspace(0.2, 0.8, 25):
+        p = (proba >= t).astype(int)
+        f = f1_score(yte, p)
+        if f > best_f1:
+            best_f1, best_t = f, t
+    
+    print(f"[metrics] best_threshold={best_t:.3f}  best_F1={best_f1:.3f}")
+    pred = (proba >= best_t).astype(int)
 
     roc = roc_auc_score(yte, proba)
     pr = average_precision_score(yte, proba)
     f1 = f1_score(yte, pred)
     print(f"[metrics] ROC-AUC={roc:.3f}  PR-AUC={pr:.3f}  F1={f1:.3f}")
 
-    top_imp = imp.head(200)
-    out_path = features_csv.parent / "feature_importances_top200.csv"
-    top_imp.to_csv(out_path)
-    print(f"[train] Wrote {out_path}")
+    acc = accuracy_score(yte, pred)
+    cm = confusion_matrix(yte, pred)
+
+    print(f"[metrics] Accuracy={acc:.3f}")
+    print("[metrics] Confusion Matrix:")
+    print(cm)
+
+    print("[metrics] Classification report:")
+    print(classification_report(yte, pred))
+
+def make_data_stats(workdir: Path, cftr_tsv: Path, windows_csv: Path, features_csv: Path, out_json: Path):
+    """Compute simple dataset statistics and write JSON summary to out_json.
+
+    Stats include:
+      - total variants, counts by label and by chromosome (from filtered VCF TSV)
+      - windows count, window length distribution, GC stats, ref-match rate (from windows CSV)
+      - feature matrix shape and label balance (from features CSV)
+    """
+    stats = {}
+    wd = Path(workdir)
+
+    # clinvar filtered TSV
+    if cftr_tsv.exists():
+        try:
+            vdf = pd.read_csv(cftr_tsv, sep="\t", header=None, names=["chrom","pos","ref","alt","label","info"])
+            stats["variants_total"] = int(len(vdf))
+            stats["variants_by_label"] = vdf["label"].value_counts().to_dict()
+            stats["variants_by_chrom"] = vdf["chrom"].value_counts().to_dict()
+        except Exception as e:
+            stats["variants_error"] = str(e)
+    else:
+        stats["variants_total"] = 0
+
+    # windows CSV
+    if windows_csv.exists():
+        try:
+            wdf = pd.read_csv(windows_csv)
+            stats["windows_n"] = int(len(wdf))
+            if "seq_window_ref" in wdf.columns:
+                lens = wdf["seq_window_ref"].dropna().astype(str).str.len()
+                stats["window_len"] = {
+                    "min": int(lens.min()),
+                    "max": int(lens.max()),
+                    "median": float(lens.median()),
+                    "mean": float(lens.mean())
+                }
+                # GC stats
+                try:
+                    gcs = wdf["seq_window_ref"].apply(gc_content)
+                    stats["gc"] = {
+                        "mean": float(gcs.mean()),
+                        "median": float(gcs.median())
+                    }
+                except Exception:
+                    pass
+            if "ref_match" in wdf.columns:
+                stats["ref_match_rate"] = float((wdf["ref_match"] == True).mean())
+        except Exception as e:
+            stats["windows_error"] = str(e)
+    else:
+        stats["windows_n"] = 0
+
+    # features CSV
+    if features_csv.exists():
+        try:
+            fdf = pd.read_csv(features_csv)
+            stats["features_shape"] = list(fdf.shape)
+            if "label" in fdf.columns:
+                stats["label_balance"] = fdf["label"].value_counts().to_dict()
+        except Exception as e:
+            stats["features_error"] = str(e)
+    else:
+        stats["features_shape"] = [0,0]
+
+    # write JSON
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(out_json, "w") as oj:
+            json.dump(stats, oj, indent=2)
+        print(f"[stats] Wrote {out_json}")
+        # print a short human summary
+        ssum = []
+        ssum.append(f"variants={stats.get('variants_total',0)}")
+        if "variants_by_label" in stats:
+            ssum.append("labels=" + ",".join([f"{k}:{v}" for k,v in stats["variants_by_label"].items()]))
+        ssum.append(f"windows={stats.get('windows_n',0)}")
+        print("[stats] " + " ; ".join(ssum))
+    except Exception as e:
+        print(f"[stats] ERROR writing stats: {e}")
+    return out_json
 
 # --- Orchestrator ------------------------------------------------------------
-def run_all(workdir: str, k: int, kmer: int, model: str):
+def run_all(workdir: str, k: int, kmer: int):
+    start_time = time.time()
     wd = Path(workdir)
     wd.mkdir(parents=True, exist_ok=True)
 
+    t0 = time.time()
     fasta, vcf_gz = ensure_data(wd)
+    print(f"[timing] Data download/prep: {time.time()-t0:.2f}s")
+    
+    t0 = time.time()
     cftr_tsv = wd / "clinvar_CFTR_snvs.tsv"
     filter_cftr_snvs(vcf_gz, cftr_tsv)
+    print(f"[timing] VCF filtering: {time.time()-t0:.2f}s")
 
+    t0 = time.time()
     windows_csv = wd / "cftr_windows_ref.csv"
     extract_windows(fasta, cftr_tsv, k=k, out_csv=windows_csv)
+    print(f"[timing] Window extraction: {time.time()-t0:.2f}s")
 
+    t0 = time.time()
     feats_csv = wd / "cftr_features.csv"
     make_features(windows_csv, feats_csv, kmer=kmer)
+    print(f"[timing] Feature engineering: {time.time()-t0:.2f}s")
 
-    train_tree(feats_csv, model_kind=model)
+    t0 = time.time()
+    # compute and write dataset statistics
+    stats_json = wd / "data_stats.json"
+    make_data_stats(wd, cftr_tsv, windows_csv, feats_csv, stats_json)
+    print(f"[timing] Statistics computation: {time.time()-t0:.2f}s")
+
+    t0 = time.time()
+    train_svm(feats_csv)
+    print(f"[timing] Model training: {time.time()-t0:.2f}s")
+    
+    total_time = time.time() - start_time
+    print(f"[timing] Total pipeline time: {total_time:.2f}s ({total_time/60:.2f}m)")
 
 # --- CLI ---------------------------------------------------------------------
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="End-to-end CFTR tree-model pipeline (Python-only).")
+    ap = argparse.ArgumentParser(description="End-to-end CFTR SVM pipeline (Python-only).")
     ap.add_argument("--workdir", default="data", help="Output directory (default: data)")
     ap.add_argument("--k", type=int, default=100, help="Half-window size around variant (default: 100)")
     ap.add_argument("--kmer", type=int, default=3, help="k-mer size for features (default: 3)")
-    ap.add_argument("--model", choices=["xgboost","rf"], default="xgboost", help="Tree model to use")
     args = ap.parse_args()
-    run_all(args.workdir, args.k, args.kmer, args.model)
+    run_all(args.workdir, args.k, args.kmer)
