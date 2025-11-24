@@ -151,181 +151,141 @@ def extract_windows(fasta_path: Path, cftr_vcf_tsv: Path, k: int, out_csv: Path)
     print(f"[seq] Wrote {out_csv}  (N={len(df)})")
     return out_csv
 
-# --- Step 4: Feature engineering ---------------------------------------------
-NUCS = ["A","C","G","T"]
+# --- Step 4: Sequence encoding for CNN ---------------------------------------
+def one_hot_encode_seq(seq):
+    """Convert DNA sequence to one-hot encoding for PyTorch CNN (4 x seq_len)"""
+    mapping = {"A":0, "C":1, "G":2, "T":3}
+    arr = np.zeros((4, len(seq)), dtype=np.float32)
+    for i, base in enumerate(seq.upper()):
+        if base in mapping:
+            arr[mapping[base], i] = 1.0
+    return arr
 
-def gc_content(seq):
-    s = seq.upper()
-    gc = s.count("G") + s.count("C")
-    atgc = sum(s.count(b) for b in NUCS)
-    return gc / max(1, atgc)
+# --- Step 5: PyTorch CNN Model ----------------------------------------------
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-def revcomp(seq):
-    comp = str.maketrans("ACGTacgt","TGCAtgca")
-    return seq.translate(comp)[::-1]
+class CFTR_CNN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv1d(4, 64, kernel_size=7, padding=3)
+        self.conv2 = nn.Conv1d(64, 128, kernel_size=7, padding=3)
+        self.conv3 = nn.Conv1d(128, 256, kernel_size=7, padding=3)
+        self.pool = nn.MaxPool1d(kernel_size=2)
+        # Calculate flattened size: 201 // 2 // 2 // 2 = 25
+        self.fc1 = nn.Linear(256 * 25, 128)
+        self.fc2 = nn.Linear(128, 1)
+    
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = self.pool(x)
+        x = F.relu(self.conv2(x))
+        x = self.pool(x)
+        x = F.relu(self.conv3(x))
+        x = self.pool(x)
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        return torch.sigmoid(self.fc2(x))
 
-def symmetry(seq):
-    s, rc = seq.upper(), revcomp(seq.upper())
-    n = min(len(s), len(rc))
-    return 0.0 if n==0 else float(np.mean([s[i]==rc[i] for i in range(n)]))
-
-def is_transition(r,a):
-    pur, pyr = set(["A","G"]), set(["C","T"])
-    r, a = r.upper(), a.upper()
-    return int((r in pur and a in pur) or (r in pyr and a in pyr))
-
-def kmer_vec(seq, k, vocab):
-    s = re.sub(r"[^ACGT]", "N", seq.upper())
-    cnt = Counter(s[i:i+k] for i in range(len(s)-k+1))
-    v = np.array([cnt.get(km,0) for km in vocab], dtype=np.float32)
-    tot = v.sum() or 1.0
-    return v / tot
-
-def make_features(windows_csv: Path, out_csv: Path, kmer=3):
-    print(f"[feat] Reading {windows_csv}")
+# --- Step 6: Train CNN model -------------------------------------------------
+def train_cnn(windows_csv: Path, epochs=8, batch_size=32, lr=1e-3):
+    from torch.utils.data import Dataset, DataLoader
+    from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+    
+    print(f"[cnn] Loading and encoding sequences...")
     df = pd.read_csv(windows_csv)
-    df = df[df["ref_match"]==True].copy()
-
-    # center base (assumes windows are centered)
-    L = int(df["seq_window_ref"].str.len().median())
-    center = max(0, L//2)
-    def center_base(s):
-        return s[center].upper() if isinstance(s, str) and len(s)>center else "N"
-
-    df["gc"] = df["seq_window_ref"].apply(gc_content)
-    df["symmetry"] = df["seq_window_ref"].apply(symmetry)
-    df["win_len"] = df["seq_window_ref"].str.len()
-    df["center_ref"] = df["seq_window_ref"].apply(center_base)
-    df["center_ref_mismatch"] = (df["center_ref"] != df["ref"].str.upper()).astype(int)
-    df["is_transition"] = [is_transition(r,a) for r,a in zip(df["ref"], df["alt"])]
-
-    # one-hots for small categoricals
-    for col in ["center_ref","ref","alt","chrom"]:
-        df = pd.concat([df, pd.get_dummies(df[col].astype(str), prefix=col)], axis=1)
-
-    # k-mer features
-    vocab = ["".join(p) for p in itertools.product(NUCS, repeat=kmer)]
-    km = np.vstack(df["seq_window_ref"].apply(lambda s: kmer_vec(s, kmer, vocab)).values)
-    kcols = [f"kmer_{k}" for k in vocab]
-    kdf = pd.DataFrame(km, columns=kcols, index=df.index)
-
-    # combine numeric features, categorical one-hot columns (if any), and k-mer features
-    base_cols = ["gc","symmetry","win_len","center_ref_mismatch","is_transition"]
-    cat_cols = [c for c in df.columns if c.startswith(("center_ref_","ref_","alt_","chrom_"))]
-    parts = [df[base_cols]]
-    if len(cat_cols) > 0:
-        parts.append(df[cat_cols])
-    parts.append(kdf)
-    X = pd.concat(parts, axis=1)
-    y = df["label"].map({"benign":0,"pathogenic":1}).astype(int)
-
-    out = pd.concat([X, y.rename("label")], axis=1)
-    out.to_csv(out_csv, index=False)
-    print(f"[feat] Wrote {out_csv}  shape={out.shape}")
-    return out_csv
-
-# --- Step 5: Train a tree model ----------------------------------------------
-def train_tree(features_csv: Path, model_kind: str = "lightgbm"):
-    df = pd.read_csv(features_csv)
-    X = df.drop(columns=["label"])
-    y = df["label"].astype(int)
-
+    df = df[df["ref_match"] == True].reset_index(drop=True)
+    
+    # Make the label
+    y = df["label"].map({"benign":0,"pathogenic":1}).astype(int).values
+    
+    # One-hot encode all sequences
+    X = np.stack([one_hot_encode_seq(s) for s in df["seq_window_ref"]])
+    print(f"[cnn] Encoded {len(X)} sequences with shape {X.shape}")
+    
+    # Train/test split
     Xtr, Xte, ytr, yte = train_test_split(X, y, stratify=y, test_size=0.2, random_state=42)
-    pos = int(ytr.sum()); neg = len(ytr) - pos
-    scale_pos_weight = neg / max(1, pos)
-
-    try:
-        import lightgbm as lgb
-        from sklearn.model_selection import GridSearchCV
-        
-        print("[train] Running LightGBM hyperparameter search...")
-        params = {
-            "n_estimators": [200, 600],
-            "max_depth": [3, 5, 8],
-            "learning_rate": [0.01, 0.03, 0.1],
-            "num_leaves": [15, 31, 63]
-        }
-        
-        base = lgb.LGBMClassifier(
-            subsample=0.9,
-            colsample_bytree=0.9,
-            reg_lambda=1.0,
-            scale_pos_weight=scale_pos_weight,
-            random_state=42,
-            verbose=-1
-        )
-        
-        gs = GridSearchCV(base, params, cv=3, scoring="f1", n_jobs=-1, verbose=1)
-        gs.fit(Xtr, ytr)
-        print(f"[train] best LightGBM params: {gs.best_params_}")
-        
-        model = gs.best_estimator_
-        proba = model.predict_proba(Xte)[:,1]
-        imp = pd.Series(model.feature_importances_, index=X.columns).sort_values(ascending=False)
-        print("[train] Model: LightGBM")
-    except Exception as e:
-        print(f"[train] LightGBM unavailable ({e}). Falling back to RandomForest.")
-        from sklearn.ensemble import RandomForestClassifier
-        from sklearn.model_selection import GridSearchCV
-        
-        print("[train] Running RandomForest hyperparameter search...")
-        params = {
-            "n_estimators": [200, 600],
-            "max_depth": [None, 8, 16],
-            "min_samples_leaf": [1, 5, 10]
-        }
-        
-        base = RandomForestClassifier(
-            class_weight={0:1.0, 1:max(1.0, scale_pos_weight)},
-            random_state=42,
-            n_jobs=-1
-        )
-        
-        gs = GridSearchCV(base, params, cv=3, scoring="f1", n_jobs=-1, verbose=1)
-        gs.fit(Xtr, ytr)
-        print(f"[train] best RF params: {gs.best_params_}")
-        
-        model = gs.best_estimator_
-        proba = model.predict_proba(Xte)[:,1]
-        # impurity-based importances
-        imp = pd.Series(model.feature_importances_, index=X.columns).sort_values(ascending=False)
-        print("[train] Model: RandomForest")
-
+    
+    class SeqDataset(Dataset):
+        def __init__(self, X, y):
+            self.X = torch.tensor(X, dtype=torch.float32)
+            self.y = torch.tensor(y, dtype=torch.float32)
+        def __len__(self): return len(self.X)
+        def __getitem__(self, i): return self.X[i], self.y[i]
+    
+    train_loader = DataLoader(SeqDataset(Xtr, ytr), batch_size=batch_size, shuffle=True)
+    test_loader  = DataLoader(SeqDataset(Xte, yte), batch_size=batch_size)
+    
+    # Model
+    print(f"[cnn] Building CNN model...")
+    model = CFTR_CNN()
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    loss_fn = nn.BCELoss()
+    
+    # Training loop
+    print(f"[cnn] Training for {epochs} epochs...")
+    for ep in range(epochs):
+        model.train()
+        total = 0
+        for xb, yb in train_loader:
+            opt.zero_grad()
+            pred = model(xb).squeeze()
+            loss = loss_fn(pred, yb)
+            loss.backward()
+            opt.step()
+            total += loss.item()
+        print(f"[cnn] Epoch {ep+1}/{epochs} loss={total/len(train_loader):.4f}")
+    
+    # Evaluation
+    print(f"[cnn] Evaluating on test set...")
+    model.eval()
+    all_pred, all_true = [], []
+    with torch.no_grad():
+        for xb, yb in test_loader:
+            p = model(xb).squeeze()
+            all_pred.extend(p.numpy().tolist())
+            all_true.extend(yb.numpy().tolist())
+    
+    # Convert to numpy arrays
+    all_pred = np.array(all_pred)
+    all_true = np.array(all_true)
+    
     # Tune decision threshold to maximize F1 score
     best_t, best_f1 = 0.5, 0
     for t in np.linspace(0.2, 0.8, 25):
-        p = (proba >= t).astype(int)
-        f = f1_score(yte, p)
+        p = (all_pred >= t).astype(int)
+        f = f1_score(all_true, p)
         if f > best_f1:
             best_f1, best_t = f, t
     
     print(f"[metrics] best_threshold={best_t:.3f}  best_F1={best_f1:.3f}")
-    pred = (proba >= best_t).astype(int)
-
-    roc = roc_auc_score(yte, proba)
-    pr = average_precision_score(yte, proba)
-    f1 = f1_score(yte, pred)
+    pred_bin = (all_pred >= best_t).astype(int)
+    
+    # Metrics
+    roc = roc_auc_score(all_true, all_pred)
+    pr = average_precision_score(all_true, all_pred)
+    f1 = f1_score(all_true, pred_bin)
+    acc = accuracy_score(all_true, pred_bin)
+    cm = confusion_matrix(all_true, pred_bin)
+    
     print(f"[metrics] ROC-AUC={roc:.3f}  PR-AUC={pr:.3f}  F1={f1:.3f}")
-    from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
-
-    acc = accuracy_score(yte, pred)
-    cm = confusion_matrix(yte, pred)
-
     print(f"[metrics] Accuracy={acc:.3f}")
     print("[metrics] Confusion Matrix:")
     print(cm)
-
     print("[metrics] Classification report:")
-    print(classification_report(yte, pred))
-
+    print(classification_report(all_true, pred_bin))
+    
     # Save metrics to file
-    metrics_file = features_csv.parent / "lightgbm_metrics.txt"
+    metrics_file = windows_csv.parent / "cnn_metrics.txt"
     with open(metrics_file, "w") as f:
         f.write("="*60 + "\n")
-        f.write("LightGBM Pipeline - CFTR Variant Classification Results\n")
+        f.write("CNN Pipeline - CFTR Variant Classification Results\n")
         f.write("="*60 + "\n\n")
-        f.write(f"Model: LightGBM Classifier\n")
-        f.write(f"Best parameters: {gs.best_params_}\n")
+        f.write(f"Model: Convolutional Neural Network (PyTorch)\n")
+        f.write(f"Training epochs: {epochs}\n")
+        f.write(f"Batch size: {batch_size}\n")
+        f.write(f"Learning rate: {lr}\n")
         f.write(f"Optimal threshold: {best_t:.3f}\n\n")
         f.write("Performance Metrics:\n")
         f.write("-" * 40 + "\n")
@@ -338,23 +298,14 @@ def train_tree(features_csv: Path, model_kind: str = "lightgbm"):
         f.write(f"{cm}\n\n")
         f.write("Classification Report:\n")
         f.write("-" * 40 + "\n")
-        f.write(classification_report(yte, pred))
+        f.write(classification_report(all_true, pred_bin))
         f.write("\n")
     print(f"[metrics] Saved to {metrics_file}")
+    
+    return model
 
-    top_imp = imp.head(200)
-    out_path = features_csv.parent / "feature_importances_top200.csv"
-    top_imp.to_csv(out_path)
-    print(f"[train] Wrote {out_path}")
-
-def make_data_stats(workdir: Path, cftr_tsv: Path, windows_csv: Path, features_csv: Path, out_json: Path):
-    """Compute simple dataset statistics and write JSON summary to out_json.
-
-    Stats include:
-      - total variants, counts by label and by chromosome (from filtered VCF TSV)
-      - windows count, window length distribution, GC stats, ref-match rate (from windows CSV)
-      - feature matrix shape and label balance (from features CSV)
-    """
+def make_data_stats(workdir: Path, cftr_tsv: Path, windows_csv: Path, out_json: Path):
+    """Compute simple dataset statistics and write JSON summary to out_json."""
     stats = {}
     wd = Path(workdir)
 
@@ -383,33 +334,12 @@ def make_data_stats(workdir: Path, cftr_tsv: Path, windows_csv: Path, features_c
                     "median": float(lens.median()),
                     "mean": float(lens.mean())
                 }
-                # GC stats
-                try:
-                    gcs = wdf["seq_window_ref"].apply(gc_content)
-                    stats["gc"] = {
-                        "mean": float(gcs.mean()),
-                        "median": float(gcs.median())
-                    }
-                except Exception:
-                    pass
             if "ref_match" in wdf.columns:
                 stats["ref_match_rate"] = float((wdf["ref_match"] == True).mean())
         except Exception as e:
             stats["windows_error"] = str(e)
     else:
         stats["windows_n"] = 0
-
-    # features CSV
-    if features_csv.exists():
-        try:
-            fdf = pd.read_csv(features_csv)
-            stats["features_shape"] = list(fdf.shape)
-            if "label" in fdf.columns:
-                stats["label_balance"] = fdf["label"].value_counts().to_dict()
-        except Exception as e:
-            stats["features_error"] = str(e)
-    else:
-        stats["features_shape"] = [0,0]
 
     # write JSON
     out_json.parent.mkdir(parents=True, exist_ok=True)
@@ -429,7 +359,7 @@ def make_data_stats(workdir: Path, cftr_tsv: Path, windows_csv: Path, features_c
     return out_json
 
 # --- Orchestrator ------------------------------------------------------------
-def run_all(workdir: str, k: int, kmer: int, model: str):
+def run_all(workdir: str, k: int):
     start_time = time.time()
     wd = Path(workdir)
     wd.mkdir(parents=True, exist_ok=True)
@@ -449,18 +379,13 @@ def run_all(workdir: str, k: int, kmer: int, model: str):
     print(f"[timing] Window extraction: {time.time()-t0:.2f}s")
 
     t0 = time.time()
-    feats_csv = wd / "cftr_features.csv"
-    make_features(windows_csv, feats_csv, kmer=kmer)
-    print(f"[timing] Feature engineering: {time.time()-t0:.2f}s")
-
-    t0 = time.time()
     # compute and write dataset statistics
     stats_json = wd / "data_stats.json"
-    make_data_stats(wd, cftr_tsv, windows_csv, feats_csv, stats_json)
+    make_data_stats(wd, cftr_tsv, windows_csv, stats_json)
     print(f"[timing] Statistics computation: {time.time()-t0:.2f}s")
 
     t0 = time.time()
-    train_tree(feats_csv, model_kind=model)
+    train_cnn(windows_csv)
     print(f"[timing] Model training: {time.time()-t0:.2f}s")
     
     total_time = time.time() - start_time
@@ -468,10 +393,8 @@ def run_all(workdir: str, k: int, kmer: int, model: str):
 
 # --- CLI ---------------------------------------------------------------------
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="End-to-end CFTR LightGBM pipeline (Python-only).")
+    ap = argparse.ArgumentParser(description="End-to-end CFTR CNN pipeline for sequence-based classification.")
     ap.add_argument("--workdir", default="data", help="Output directory (default: data)")
     ap.add_argument("--k", type=int, default=100, help="Half-window size around variant (default: 100)")
-    ap.add_argument("--kmer", type=int, default=3, help="k-mer size for features (default: 3)")
-    ap.add_argument("--model", choices=["lightgbm","rf"], default="lightgbm", help="Tree model to use")
     args = ap.parse_args()
-    run_all(args.workdir, args.k, args.kmer, args.model)
+    run_all(args.workdir, args.k)

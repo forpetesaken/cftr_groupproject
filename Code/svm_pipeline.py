@@ -305,6 +305,31 @@ def train_svm(features_csv: Path):
     print("[metrics] Classification report:")
     print(classification_report(yte, pred))
 
+    # Save metrics to file
+    metrics_file = features_csv.parent / "svm_metrics.txt"
+    with open(metrics_file, "w") as f:
+        f.write("="*60 + "\n")
+        f.write("SVM Pipeline - CFTR Variant Classification Results\n")
+        f.write("="*60 + "\n\n")
+        f.write(f"Model: Support Vector Machine (RBF kernel)\n")
+        f.write(f"PCA components: {pca.n_components_} (explained variance: {pca.explained_variance_ratio_.sum():.3f})\n")
+        f.write(f"Best parameters: {gs.best_params_}\n")
+        f.write(f"Optimal threshold: {best_t:.3f}\n\n")
+        f.write("Performance Metrics:\n")
+        f.write("-" * 40 + "\n")
+        f.write(f"ROC-AUC:      {roc:.3f}\n")
+        f.write(f"PR-AUC:       {pr:.3f}\n")
+        f.write(f"F1 Score:     {f1:.3f}\n")
+        f.write(f"Accuracy:     {acc:.3f}\n\n")
+        f.write("Confusion Matrix:\n")
+        f.write("-" * 40 + "\n")
+        f.write(f"{cm}\n\n")
+        f.write("Classification Report:\n")
+        f.write("-" * 40 + "\n")
+        f.write(classification_report(yte, pred))
+        f.write("\n")
+    print(f"[metrics] Saved to {metrics_file}")
+
 def make_data_stats(workdir: Path, cftr_tsv: Path, windows_csv: Path, features_csv: Path, out_json: Path):
     """Compute simple dataset statistics and write JSON summary to out_json.
 
